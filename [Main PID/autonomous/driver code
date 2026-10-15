@@ -1,0 +1,303 @@
+#include "vex.h"
+#include "robot-config.h"
+
+using namespace vex;
+
+competition Competition;
+
+namespace {
+
+// ===== Drivetrain geometry ==================================================
+// Measure the wheel's effective rolling diameter under the robot's weight.
+constexpr double kWheelDiameterIn = 3.25;
+// Motor revolutions for one wheel revolution.  1.0 means direct drive.
+constexpr double kExternalDriveRatio = 1.0;
+constexpr double kPi = 3.14159265358979323846;
+constexpr double kDriveDegreesPerInch =
+    (360.0 * kExternalDriveRatio) / (kPi * kWheelDiameterIn);
+
+// ===== PID tuning ===========================================================
+// Output is in volts.  Begin with these conservative values, then tune on the
+// actual field. Keep I at zero until P and D are working well.
+constexpr double kDriveP = 0.075;
+constexpr double kDriveI = 0.0;
+constexpr double kDriveD = 0.004;
+constexpr double kHeadingP = 0.055;  // heading correction during straight drives
+constexpr double kTurnP = 0.080;
+constexpr double kTurnI = 0.0;
+constexpr double kTurnD = 0.003;
+
+constexpr int kLoopMs = 10;
+constexpr double kDefaultMaxVoltage = 10.0;
+
+enum class AutonRoutine {
+  RED_POSITIVE,
+  RED_NEGATIVE,
+  BLUE_POSITIVE,
+  BLUE_NEGATIVE,
+  SKILLS
+};
+
+// Change this one line before a match. Positive / negative means the side of
+// the field as defined by your team; it is not a VEX rulebook term.
+constexpr AutonRoutine kSelectedAuton = AutonRoutine::RED_POSITIVE;
+
+double clampValue(double value, double low, double high) {
+  if (value < low) return low;
+  if (value > high) return high;
+  return value;
+}
+
+double absoluteValue(double value) {
+  return value < 0.0 ? -value : value;
+}
+
+double wrapAngle(double degreesValue) {
+  while (degreesValue > 180.0) degreesValue -= 360.0;
+  while (degreesValue <= -180.0) degreesValue += 360.0;
+  return degreesValue;
+}
+
+double drivePositionDegrees() {
+  return (LeftDrive.position(degrees) + RightDrive.position(degrees)) / 2.0;
+}
+
+void setDriveVoltage(double leftVolts, double rightVolts) {
+  LeftDrive.spin(forward, clampValue(leftVolts, -12.0, 12.0), volt);
+  RightDrive.spin(forward, clampValue(rightVolts, -12.0, 12.0), volt);
+}
+
+void stopDrive(brakeType stopping = brake) {
+  LeftDrive.stop(stopping);
+  RightDrive.stop(stopping);
+}
+
+// PID straight drive. Positive inches drives forward after reversal flags are
+// correctly set in robot-config.cpp. It holds its initial inertial heading.
+bool driveDistance(double inches, int timeoutMs = 2500,
+                   double maxVoltage = kDefaultMaxVoltage) {
+  LeftDrive.setPosition(0, degrees);
+  RightDrive.setPosition(0, degrees);
+
+  const double targetDegrees = inches * kDriveDegreesPerInch;
+  const double heldHeading = Inertial.heading(degrees);
+  double integral = 0.0;
+  double lastError = targetDegrees;
+  int settledLoops = 0;
+  timer motionTimer;
+
+  while (motionTimer.time(msec) < timeoutMs) {
+    const double error = targetDegrees - drivePositionDegrees();
+    integral = clampValue(integral + error * (kLoopMs / 1000.0), -300.0, 300.0);
+    const double derivative = (error - lastError) / (kLoopMs / 1000.0);
+    const double forwardVoltage =
+        kDriveP * error + kDriveI * integral + kDriveD * derivative;
+
+    const double headingError = wrapAngle(heldHeading - Inertial.heading(degrees));
+    const double turnVoltage = kHeadingP * headingError;
+    const double limitedForward =
+        clampValue(forwardVoltage, -maxVoltage, maxVoltage);
+    setDriveVoltage(clampValue(limitedForward + turnVoltage, -maxVoltage, maxVoltage),
+                    clampValue(limitedForward - turnVoltage, -maxVoltage, maxVoltage));
+
+    if (absoluteValue(error) < 12.0) {
+      ++settledLoops;
+    } else {
+      settledLoops = 0;
+    }
+    if (settledLoops >= 12) {
+      stopDrive(brake);
+      return true;
+    }
+
+    lastError = error;
+    wait(kLoopMs, msec);
+  }
+
+  stopDrive(brake);
+  return false;  // Motion hit timeout; reduce distance/speed or retune.
+}
+
+// PID inertial turn. Heading uses VEX's 0-360 degree convention, so this also
+// accepts headings such as -90 or 450 degrees.
+bool turnToHeading(double targetHeading, int timeoutMs = 1800,
+                   double maxVoltage = kDefaultMaxVoltage) {
+  double integral = 0.0;
+  double lastError = wrapAngle(targetHeading - Inertial.heading(degrees));
+  int settledLoops = 0;
+  timer motionTimer;
+
+  while (motionTimer.time(msec) < timeoutMs) {
+    const double error = wrapAngle(targetHeading - Inertial.heading(degrees));
+    integral = clampValue(integral + error * (kLoopMs / 1000.0), -200.0, 200.0);
+    const double derivative = (error - lastError) / (kLoopMs / 1000.0);
+    const double turnVoltage =
+        kTurnP * error + kTurnI * integral + kTurnD * derivative;
+
+    const double limitedVoltage = clampValue(turnVoltage, -maxVoltage, maxVoltage);
+    setDriveVoltage(limitedVoltage, -limitedVoltage);
+
+    if (absoluteValue(error) < 1.5) {
+      ++settledLoops;
+    } else {
+      settledLoops = 0;
+    }
+    if (settledLoops >= 12) {
+      stopDrive(brake);
+      return true;
+    }
+
+    lastError = error;
+    wait(kLoopMs, msec);
+  }
+
+  stopDrive(brake);
+  return false;
+}
+
+void runIntake(bool forwardDirection) {
+  Intake.spin(forwardDirection ? forward : reverse, 100, pct);
+}
+
+// ===== Autonomous routine slots =============================================
+// Start each route with the robot in its intended field-control starting pose.
+// Replace distances and headings after testing.  An early `return` is a safe
+// way to stop a route when a critical PID move times out.
+void autonRedPositive() {
+  runIntake(true);
+  if (!driveDistance(24.0)) return;       // TODO: first scoring-object approach
+  if (!turnToHeading(45.0)) return;       // TODO: tune for your start heading
+  if (!driveDistance(18.0)) return;       // TODO: score / toggle action
+  Intake.stop(brake);
+}
+
+void autonRedNegative() {
+  runIntake(true);
+  if (!driveDistance(20.0)) return;       // TODO: replace with red-negative path
+  if (!turnToHeading(315.0)) return;
+  if (!driveDistance(16.0)) return;
+  Intake.stop(brake);
+}
+
+void autonBluePositive() {
+  runIntake(true);
+  if (!driveDistance(24.0)) return;       // TODO: mirror/redesign for blue start
+  if (!turnToHeading(315.0)) return;
+  if (!driveDistance(18.0)) return;
+  Intake.stop(brake);
+}
+
+void autonBlueNegative() {
+  runIntake(true);
+  if (!driveDistance(20.0)) return;       // TODO: replace with blue-negative path
+  if (!turnToHeading(45.0)) return;
+  if (!driveDistance(16.0)) return;
+  Intake.stop(brake);
+}
+
+void autonSkills() {
+  // TODO: Add your Robot Skills path here. Build and verify each short segment
+  // before chaining them together.
+  if (!driveDistance(24.0)) return;
+  if (!turnToHeading(90.0)) return;
+  driveDistance(24.0);
+}
+
+void calibrateInertial() {
+  Brain.Screen.clearScreen();
+  Brain.Screen.print("Calibrating inertial...");
+  Inertial.calibrate();
+  while (Inertial.isCalibrating()) {
+    wait(20, msec);
+  }
+  Inertial.setHeading(0, degrees);
+  Brain.Screen.clearScreen();
+  Brain.Screen.print("Ready");
+}
+
+}  // namespace
+
+void pre_auton(void) {
+  vexcodeInit();
+  LeftDrive.setStopping(brake);
+  RightDrive.setStopping(brake);
+  Intake.setStopping(coast);
+  Lift.setStopping(hold);
+  Clamp.set(false);
+  calibrateInertial();
+}
+
+void autonomous(void) {
+  // Do not calibrate here: Field Control's 15-second autonomous timer is active.
+  switch (kSelectedAuton) {
+    case AutonRoutine::RED_POSITIVE:  autonRedPositive(); break;
+    case AutonRoutine::RED_NEGATIVE:  autonRedNegative(); break;
+    case AutonRoutine::BLUE_POSITIVE: autonBluePositive(); break;
+    case AutonRoutine::BLUE_NEGATIVE: autonBlueNegative(); break;
+    case AutonRoutine::SKILLS:        autonSkills(); break;
+  }
+  stopDrive(brake);
+  Intake.stop(brake);
+}
+
+void usercontrol(void) {
+  bool clampIsClosed = false;
+  bool holdDrive = false;
+  bool previousA = false;
+  bool previousB = false;
+
+  while (true) {
+    // Arcade drive: Axis3 controls forward/reverse, Axis1 controls turning.
+    int forwardPower = Controller1.Axis3.position(pct);
+    int turnPower = Controller1.Axis1.position(pct);
+    if (abs(forwardPower) < 5) forwardPower = 0;
+    if (abs(turnPower) < 5) turnPower = 0;
+    const double leftPower = clampValue(forwardPower + turnPower, -100, 100);
+    const double rightPower = clampValue(forwardPower - turnPower, -100, 100);
+    LeftDrive.spin(forward, leftPower, pct);
+    RightDrive.spin(forward, rightPower, pct);
+
+    if (Controller1.ButtonR1.pressing()) {
+      runIntake(true);
+    } else if (Controller1.ButtonR2.pressing()) {
+      runIntake(false);
+    } else {
+      Intake.stop(coast);
+    }
+
+    if (Controller1.ButtonL1.pressing()) {
+      Lift.spin(forward, 100, pct);
+    } else if (Controller1.ButtonL2.pressing()) {
+      Lift.spin(reverse, 100, pct);
+    } else {
+      Lift.stop(hold);
+    }
+
+    const bool aPressed = Controller1.ButtonA.pressing();
+    if (aPressed && !previousA) {
+      clampIsClosed = !clampIsClosed;
+      Clamp.set(clampIsClosed);
+    }
+    previousA = aPressed;
+
+    const bool bPressed = Controller1.ButtonB.pressing();
+    if (bPressed && !previousB) {
+      holdDrive = !holdDrive;
+      LeftDrive.setStopping(holdDrive ? hold : coast);
+      RightDrive.setStopping(holdDrive ? hold : coast);
+    }
+    previousB = bPressed;
+
+    wait(20, msec);
+  }
+}
+
+int main() {
+  pre_auton();
+  Competition.autonomous(autonomous);
+  Competition.drivercontrol(usercontrol);
+
+  while (true) {
+    wait(100, msec);
+  }
+}
