@@ -1,0 +1,31 @@
+#pragma once
+
+#include "vex.h"
+
+using namespace vex;
+
+// ---------------------------------------------------------------------------
+// ROBOT HARDWARE CONFIGURATION
+// Change every port, cartridge ratio, and reversed flag to match YOUR robot.
+// Motors are declared in robot-config.cpp.
+// ---------------------------------------------------------------------------
+
+extern brain Brain;
+extern controller Controller1;
+
+extern motor LeftFront;
+extern motor LeftBack;
+extern motor RightFront;
+extern motor RightBack;
+extern motor_group LeftDrive;
+extern motor_group RightDrive;
+
+extern inertial Inertial;
+
+// Example mechanisms. Keep them if your robot has them, or delete their
+// declarations and their matching driver-control code in main.cpp.
+extern motor Intake;
+extern motor Lift;
+extern digital_out Clamp;
+
+void vexcodeInit(void);
